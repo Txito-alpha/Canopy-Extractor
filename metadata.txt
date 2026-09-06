@@ -1,0 +1,40 @@
+[general]
+name=Canopy Extractor
+qgisMinimumVersion=3.22
+description=Extracts tree tops and individual tree crown polygons from a CHM raster using single-pass numpy algorithms.
+about=CHM (Canopy Height Model) から局所最大値法で樹頂点を抽出し、Dalponte & Coomes (2016) の領域拡張または Silva et al. (2016) のボロノイ分割で単木の樹冠ポリゴンを作成します。GRASS / GDAL のアルゴリズム連鎖と中間ファイルを使わず、numpy の配列演算で完結します。numpy は QGIS に同梱されています。scipy があれば自動的に使用しますが、無くても主要機能は動作します。
+version=0.3.0
+author=Hokkaido IT Team
+email=
+
+tracker=https://github.com/Txito-alpha/Canopy-Extractor/issues
+repository=https://github.com/Txito-alpha/Canopy-Extractor
+homepage=https://github.com/Txito-alpha/Canopy-Extractor
+
+hasProcessingProvider=yes
+category=Raster
+icon=
+experimental=True
+deprecated=False
+
+changelog=0.3.0
+    - プラグイン名を Canopy Extractor に変更 (プロバイダ ID: canopyextractor)
+    - 樹冠ポリゴン生成アルゴリズムを追加
+      領域拡張 (Dalponte & Coomes 2016) とボロノイ (Silva et al. 2016)
+    - 樹冠の最大半径はメートル指定 (セルサイズから自動換算)
+    - 樹冠投影面積 crown_area をセル数から直接算出
+    - ポリゴン化は gdal.Polygonize (MEM 経由) を主、自前の境界追跡を保険とする
+  0.2.0
+    - CHM 平滑化オプションを追加 (平均フィルタ / ガウシアン)
+      NoData を除外する正規化畳み込みで実装
+    - ガウシアンの sigma はメートル指定 (セルサイズから自動換算)
+    - 樹高の取得元を選択可能に (既定は元の CHM)
+    - 平滑化のカーネル半径をタイル処理の halo に加算
+  0.1.1
+    - GDAL の ReadAsArray をやめ ReadRaster + numpy で読むよう変更
+      (osgeo.gdal_array と numpy の ABI 不一致による ImportError を回避)
+    - リーダ生成時に試し読みを行い、失敗時は QGIS プロバイダ経由に自動切替
+    - 使用中の計算バックエンドと NoData をログに出力
+  0.1.0
+    - プロトタイプ初版
+    - Processing モデル 樹頂点抽出0_5_0 の numpy 1 パス実装
