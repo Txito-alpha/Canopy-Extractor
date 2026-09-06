@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import struct
+import sys
+import types
 import unittest
 
 import numpy as np
@@ -13,6 +15,12 @@ import numpy as np
 from ..core import crown, polygonize, raster_reader
 
 NEIGHBOURS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+
+
+def _ring_area(ring):
+    points = np.asarray(ring, dtype=np.float64)
+    x, y = points[:, 0], points[:, 1]
+    return abs(float(np.sum(x[:-1] * y[1:] - x[1:] * y[:-1])) / 2.0)
 
 
 def reference_grow(chm, seed_rows, seed_cols, th_tree=2.0, th_seed=0.45,
@@ -407,3 +415,130 @@ class TestPolygonize(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPolygonizeRings(unittest.TestCase):
+    """環経路 (WKB を経由しない出力) の検証."""
+
+    GT = (100.0, 1.0, 0.0, 200.0, 0.0, -1.0)
+
+    def test_rings_and_wkb_agree(self):
+        chm, rows, cols = synthetic_stand(120, 14)
+        order = np.argsort(rows, kind="stable")
+        labels = crown.grow_region(
+            chm, rows[order], cols[order], max_cr=6)
+
+        rings = polygonize.polygonize_numpy_rings(labels, self.GT)
+        wkbs = polygonize.polygonize_numpy(labels, self.GT)
+        self.assertEqual(set(rings), set(wkbs))
+        self.assertGreater(len(rings), 0)
+
+    def test_ring_area_matches_cell_count(self):
+        labels = np.zeros((12, 12), dtype=np.int32)
+        labels[2:9, 2:9] = 1
+        labels[5, 5] = 0
+        rings = polygonize.polygonize_numpy_rings(labels, self.GT)
+        polygons = rings[1]
+        self.assertEqual(len(polygons), 1)
+        outer, inner = polygons[0][0], polygons[0][1]
+        self.assertAlmostEqual(_ring_area(outer), 49.0, places=6)
+        self.assertAlmostEqual(_ring_area(inner), 1.0, places=6)
+
+    def test_rings_are_closed(self):
+        labels = np.zeros((8, 8), dtype=np.int32)
+        labels[2:5, 2:5] = 1
+        for polygon in polygonize.polygonize_numpy_rings(labels, self.GT)[1]:
+            for ring in polygon:
+                self.assertEqual(ring[0], ring[-1])
+                self.assertGreaterEqual(len(ring), 4)
+
+
+class TestGdalPolygonizeFailure(unittest.TestCase):
+    """gdal.Polygonize が黙って 0 件を返す状況を検知できること.
+
+    0.3.0 ではこれが握り潰されて出力が空になっていた。
+    """
+
+    def setUp(self):
+        self.labels = np.zeros((10, 10), dtype=np.int32)
+        self.labels[3:7, 3:7] = 1
+        self.gt = (0.0, 1.0, 0.0, 0.0, 0.0, -1.0)
+
+    def tearDown(self):
+        for name in ("osgeo", "osgeo.gdal", "osgeo.ogr"):
+            sys.modules.pop(name, None)
+
+    def _install_fake_osgeo(self, feature_count):
+        gdal = types.ModuleType("osgeo.gdal")
+        gdal.GDT_Int32 = 5
+        gdal.GDT_Byte = 1
+
+        class FakeBand(object):
+            def WriteRaster(self, *args, **kwargs):
+                return 0
+
+        class FakeDataset(object):
+            def SetGeoTransform(self, gt):
+                return 0
+
+            def GetRasterBand(self, index):
+                return FakeBand()
+
+        class FakeDriver(object):
+            def Create(self, name, width, height, bands, dtype):
+                return FakeDataset()
+
+        gdal.GetDriverByName = lambda name: FakeDriver()
+        gdal.Polygonize = lambda band, mask, layer, field, options: 0
+
+        ogr = types.ModuleType("osgeo.ogr")
+        ogr.wkbPolygon = 3
+        ogr.wkbMultiPolygon = 6
+        ogr.wkbMultiPolygon25D = 0x80000006
+        ogr.OFTInteger = 0
+        ogr.FieldDefn = lambda name, kind: object()
+
+        class FakeLayer(object):
+            def CreateField(self, defn):
+                return 0
+
+            def ResetReading(self):
+                return None
+
+            def __iter__(self):
+                return iter([])
+
+        class FakeSource(object):
+            def CreateLayer(self, name, srs, kind):
+                return FakeLayer()
+
+        class FakeOgrDriver(object):
+            def CreateDataSource(self, name):
+                return FakeSource()
+
+        ogr.GetDriverByName = lambda name: FakeOgrDriver()
+
+        osgeo = types.ModuleType("osgeo")
+        osgeo.gdal = gdal
+        osgeo.ogr = ogr
+        sys.modules["osgeo"] = osgeo
+        sys.modules["osgeo.gdal"] = gdal
+        sys.modules["osgeo.ogr"] = ogr
+
+    def test_empty_result_raises(self):
+        self._install_fake_osgeo(0)
+        with self.assertRaises(IOError):
+            polygonize._polygonize_gdal_features(self.labels, self.gt)
+
+    def test_wrapper_falls_back_to_numpy(self):
+        self._install_fake_osgeo(0)
+        shapes, route = polygonize.polygonize(self.labels, self.gt)
+        self.assertEqual(set(shapes), {1})
+        self.assertIn("numpy", route)
+        self.assertIn("GDAL 失敗", route)
+
+    def test_rings_wrapper_falls_back_to_numpy(self):
+        self._install_fake_osgeo(0)
+        shapes, route = polygonize.polygonize_rings(self.labels, self.gt)
+        self.assertEqual(set(shapes), {1})
+        self.assertIn("numpy", route)

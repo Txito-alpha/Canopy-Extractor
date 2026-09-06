@@ -48,35 +48,71 @@ def multipolygon_wkb(polygons):
 # GDAL 経路
 # ---------------------------------------------------------------------------
 
-def polygonize_gdal(labels, geotransform):
-    """gdal.Polygonize でラベル配列をポリゴン化する."""
+def _polygonize_gdal_features(labels, geotransform):
+    """gdal.Polygonize を実行し (ラベル, OGR ジオメトリ) のリストを返す.
+
+    黙って 0 件を返すのが一番困るので, ラベルがあるのに何も出てこなければ
+    例外にして呼び出し側で自前実装に切り替えられるようにする。
+    マスクバンドは Byte で作る (GDAL のマスクは Byte が前提)。
+    """
     from osgeo import gdal, ogr
 
     height, width = labels.shape
     array = np.ascontiguousarray(labels, dtype=np.int32)
+    expected = int((array > 0).sum())
 
     driver = gdal.GetDriverByName("MEM")
-    dataset = driver.Create("", width, height, 2, gdal.GDT_Int32)
-    if dataset is None:
-        raise IOError("MEM ラスタを作成できません。")
-    dataset.SetGeoTransform(geotransform)
+    if driver is None:
+        raise IOError("MEM ドライバが使えません。")
 
-    # バンド 1 = ラベル, バンド 2 = マスク (0 の背景を除外する)
-    dataset.GetRasterBand(1).WriteRaster(
+    label_ds = driver.Create("", width, height, 1, gdal.GDT_Int32)
+    mask_ds = driver.Create("", width, height, 1, gdal.GDT_Byte)
+    if label_ds is None or mask_ds is None:
+        raise IOError("MEM ラスタを作成できません。")
+    label_ds.SetGeoTransform(geotransform)
+    mask_ds.SetGeoTransform(geotransform)
+
+    label_ds.GetRasterBand(1).WriteRaster(
         0, 0, width, height, array.tobytes(), width, height, gdal.GDT_Int32)
-    mask = np.ascontiguousarray((array > 0).astype(np.int32))
-    dataset.GetRasterBand(2).WriteRaster(
-        0, 0, width, height, mask.tobytes(), width, height, gdal.GDT_Int32)
+    mask = np.ascontiguousarray((array > 0).astype(np.uint8))
+    mask_ds.GetRasterBand(1).WriteRaster(
+        0, 0, width, height, mask.tobytes(), width, height, gdal.GDT_Byte)
 
     ogr_driver = ogr.GetDriverByName("Memory")
+    if ogr_driver is None:
+        raise IOError("OGR Memory ドライバが使えません。")
+
+    features = _run_polygonize(
+        ogr_driver, label_ds.GetRasterBand(1), mask_ds.GetRasterBand(1))
+
+    if not features and expected > 0:
+        # マスクバンドが効いていない可能性があるので, マスク無しで再試行する。
+        # 背景も出てくるが, ラベル 0 として捨てる。
+        features = _run_polygonize(
+            ogr_driver, label_ds.GetRasterBand(1), None)
+
+    label_ds = None
+    mask_ds = None
+
+    if not features and expected > 0:
+        raise IOError(
+            "gdal.Polygonize が 1 件も返しませんでした "
+            "(割当セル %d)" % expected)
+    return features
+
+
+def _run_polygonize(ogr_driver, label_band, mask_band):
+    from osgeo import gdal, ogr
+
     source = ogr_driver.CreateDataSource("polygonize")
     layer = source.CreateLayer("crowns", None, ogr.wkbPolygon)
     layer.CreateField(ogr.FieldDefn("label", ogr.OFTInteger))
 
-    gdal.Polygonize(dataset.GetRasterBand(1), dataset.GetRasterBand(2),
-                    layer, 0, [])
+    status = gdal.Polygonize(label_band, mask_band, layer, 0, [])
+    if status != 0:
+        raise IOError("gdal.Polygonize が失敗しました (code %s)" % status)
 
-    result = {}
+    features = []
     layer.ResetReading()
     for feature in layer:
         label = feature.GetFieldAsInteger(0)
@@ -85,13 +121,22 @@ def polygonize_gdal(labels, geotransform):
         geometry = feature.GetGeometryRef()
         if geometry is None:
             continue
-        result.setdefault(label, []).append(bytes(geometry.ExportToWkb()))
+        features.append((label, geometry.Clone()))
 
     layer = None
     source = None
-    dataset = None
+    return features
 
-    return {label: multipolygon_wkb(parts) for label, parts in result.items()}
+
+def polygonize_gdal(labels, geotransform):
+    """gdal.Polygonize でラベル配列をポリゴン化する (WKB を返す)."""
+    result = {}
+    for label, geometry in _polygonize_gdal_features(labels, geotransform):
+        # 明示的にリトルエンディアンで出力する (既定は big endian)
+        result.setdefault(label, []).append(
+            bytes(geometry.ExportToWkb(byte_order=1)))
+    return {label: multipolygon_wkb(parts)
+            for label, parts in result.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -153,8 +198,12 @@ def _to_map(ring, geotransform):
             for x, y in ring]
 
 
-def polygonize_numpy(labels, geotransform):
-    """自前実装によるポリゴン化 (GDAL が使えない環境向けの保険)."""
+def polygonize_numpy_rings(labels, geotransform):
+    """自前実装. {ラベル: [ポリゴン, ...]} を返す.
+
+    ポリゴンは環のリストで, 先頭が外環, 以降が内環 (穴)。
+    環は (x, y) タプルのリスト (地図座標)。
+    """
     height, width = labels.shape
     rows, cols = np.nonzero(labels)
     if rows.size == 0:
@@ -185,19 +234,63 @@ def polygonize_numpy(labels, geotransform):
             outer, inner = rings, []
 
         if len(outer) == 1:
-            polygons = [polygon_wkb(
-                [_to_map(r, geotransform) for r in outer + inner])]
+            polygons = [[_to_map(r, geotransform) for r in outer + inner]]
         else:
-            # 連結成分が複数。穴の帰属は面積最大の外環にまとめる (近似)
-            polygons = [polygon_wkb([_to_map(r, geotransform)])
-                        for r in outer]
-        result[label] = multipolygon_wkb(polygons)
+            # 連結成分が複数。穴は落とす (近似)
+            polygons = [[_to_map(r, geotransform)] for r in outer]
+        result[label] = polygons
     return result
+
+
+def polygonize_numpy(labels, geotransform):
+    """自前実装によるポリゴン化 (WKB を返す)."""
+    rings = polygonize_numpy_rings(labels, geotransform)
+    return {label: multipolygon_wkb([polygon_wkb(p) for p in polygons])
+            for label, polygons in rings.items()}
 
 
 # ---------------------------------------------------------------------------
 # 入口
 # ---------------------------------------------------------------------------
+
+def polygonize_gdal_rings(labels, geotransform):
+    """gdal.Polygonize の結果を環の座標列として返す (WKB を経由しない)."""
+    from osgeo import ogr
+
+    result = {}
+    for label, geometry in _polygonize_gdal_features(labels, geotransform):
+        polygons = result.setdefault(label, [])
+        if geometry.GetGeometryType() in (ogr.wkbMultiPolygon,
+                                          ogr.wkbMultiPolygon25D):
+            parts = [geometry.GetGeometryRef(i)
+                     for i in range(geometry.GetGeometryCount())]
+        else:
+            parts = [geometry]
+        for part in parts:
+            rings = []
+            for i in range(part.GetGeometryCount()):
+                ring = part.GetGeometryRef(i)
+                rings.append([(p[0], p[1]) for p in ring.GetPoints()])
+            if rings:
+                polygons.append(rings)
+    return result
+
+
+def polygonize_rings(labels, geotransform, prefer_gdal=True):
+    """ラベル配列を環の座標列に変換する. (結果, 使用経路名) を返す.
+
+    WKB を経由しないので, WKB の解釈で問題が起きる環境でも使える。
+    """
+    if prefer_gdal:
+        try:
+            return (polygonize_gdal_rings(labels, geotransform),
+                    "gdal.Polygonize (環)")
+        except Exception as error:  # noqa: BLE001 - 意図的に拾って自前実装へ
+            reason = "%s: %s" % (type(error).__name__, error)
+            return (polygonize_numpy_rings(labels, geotransform),
+                    "numpy 境界追跡 (環, GDAL 失敗: %s)" % reason)
+    return polygonize_numpy_rings(labels, geotransform), "numpy 境界追跡 (環)"
+
 
 def polygonize(labels, geotransform, prefer_gdal=True):
     """ラベル配列をポリゴン化する. (結果, 使用経路名) を返す."""

@@ -3,7 +3,7 @@ name=Canopy Extractor
 qgisMinimumVersion=3.22
 description=Extracts tree tops and individual tree crown polygons from a CHM raster using single-pass numpy algorithms.
 about=CHM (Canopy Height Model) から局所最大値法で樹頂点を抽出し、Dalponte & Coomes (2016) の領域拡張または Silva et al. (2016) のボロノイ分割で単木の樹冠ポリゴンを作成します。GRASS / GDAL のアルゴリズム連鎖と中間ファイルを使わず、numpy の配列演算で完結します。numpy は QGIS に同梱されています。scipy があれば自動的に使用しますが、無くても主要機能は動作します。
-version=0.3.0
+version=0.3.1
 author=Hokkaido IT Team
 email=
 
@@ -17,7 +17,17 @@ icon=
 experimental=True
 deprecated=False
 
-changelog=0.3.0
+changelog=0.3.1
+    - 樹冠ポリゴンが 1 件も出力されない不具合の原因究明と対策
+    - 樹頂点レイヤの CRS が CHM と違う場合に座標変換するよう修正
+      (従来は全点が範囲外と判定され、黙って 0 件になっていた)
+    - gdal.Polygonize が 0 件を返した場合を検知し、自前実装に自動退避
+      マスクバンドを Byte で作成し、駄目ならマスク無しで再試行
+    - QgsGeometry.fromWkb は戻り値が無く失敗を通知できないため、
+      起動時に自己診断し、駄目なら座標列から組み立てる経路に切替
+    - MultiPoint の樹頂点レイヤに対応
+    - 各段階の件数をログに出力 (採用/範囲外/割当セル/ポリゴン/出力)
+  0.3.0
     - プラグイン名を Canopy Extractor に変更 (プロバイダ ID: canopyextractor)
     - 樹冠ポリゴン生成アルゴリズムを追加
       領域拡張 (Dalponte & Coomes 2016) とボロノイ (Silva et al. 2016)

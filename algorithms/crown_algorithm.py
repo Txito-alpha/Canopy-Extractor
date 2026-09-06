@@ -8,7 +8,9 @@ from qgis.core import (
     QgsFeatureSink,
     QgsField,
     QgsFields,
+    QgsCoordinateTransform,
     QgsGeometry,
+    QgsPointXY,
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
@@ -218,12 +220,13 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                 do_fill = False
 
             seeds = self._read_seeds(
-                source, geotransform, reader, id_field, feedback)
+                source, layer, geotransform, reader, id_field, context,
+                feedback)
             if seeds is None:
                 return {self.OUTPUT: dest_id}
             seed_row, seed_col, seed_id = seeds
-            feedback.pushInfo(
-                self.tr("樹頂点 %d 点を読み込みました。") % seed_row.size)
+            if seed_row.size == 0:
+                return {self.OUTPUT: dest_id}
 
             self._process_blocks(
                 reader, sink, seed_row, seed_col, seed_id, geotransform,
@@ -235,33 +238,66 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         return {self.OUTPUT: dest_id}
 
     # ------------------------------------------------------------------
-    def _read_seeds(self, source, geotransform, reader, id_field, feedback):
-        """樹頂点をセル座標に変換し, 行順に並べ替えて返す."""
+    def _read_seeds(self, source, layer, geotransform, reader, id_field,
+                    context, feedback):
+        """樹頂点をセル座標に変換し, 行順に並べ替えて返す.
+
+        樹頂点レイヤの CRS が CHM と違う場合は変換する。変換しないと
+        全ての点がラスタ範囲外と判定され, 黙って 0 件になる。
+        """
         origin_x, x_size = geotransform[0], geotransform[1]
         origin_y, y_size = geotransform[3], geotransform[5]
 
+        transform = None
+        source_crs = source.sourceCrs()
+        raster_crs = layer.crs()
+        if (source_crs.isValid() and raster_crs.isValid()
+                and source_crs != raster_crs):
+            transform = QgsCoordinateTransform(
+                source_crs, raster_crs, context.transformContext())
+            feedback.pushInfo(self.tr("樹頂点を %s から %s に変換します。")
+                              % (source_crs.authid(), raster_crs.authid()))
+
         rows, cols, ids = [], [], []
+        total = 0
+        no_geometry = 0
+        outside = 0
+
         for index, feature in enumerate(source.getFeatures()):
             if feedback.isCanceled():
                 return None
+            total += 1
             geometry = feature.geometry()
-            if geometry is None or geometry.isEmpty():
+            if geometry is None or geometry.isNull() or geometry.isEmpty():
+                no_geometry += 1
                 continue
-            point = geometry.asPoint()
-            col = int((point.x() - origin_x) / x_size)
-            row = int((point.y() - origin_y) / y_size)
-            if not (0 <= row < reader.height and 0 <= col < reader.width):
-                continue
-            rows.append(row)
-            cols.append(col)
-            if id_field:
-                value = feature[id_field]
-                ids.append(int(value) if value is not None else index + 1)
+            if transform is not None:
+                if geometry.transform(transform) != 0:
+                    no_geometry += 1
+                    continue
+
+            if geometry.isMultipart():
+                points = geometry.asMultiPoint()
             else:
-                ids.append(index + 1)
+                points = [geometry.asPoint()]
+
+            for point in points:
+                col = int(np.floor((point.x() - origin_x) / x_size))
+                row = int(np.floor((point.y() - origin_y) / y_size))
+                if not (0 <= row < reader.height and 0 <= col < reader.width):
+                    outside += 1
+                    continue
+                rows.append(row)
+                cols.append(col)
+                ids.append(self._seed_id(feature, id_field, index))
+
+        feedback.pushInfo(self.tr(
+            "樹頂点: 入力 %d 件 / 採用 %d 点 / ジオメトリ無効 %d / 範囲外 %d")
+            % (total, len(rows), no_geometry, outside))
 
         if not rows:
-            feedback.pushWarning(self.tr("有効な樹頂点がありません。"))
+            self._report_extent_mismatch(source, layer, geotransform, reader,
+                                         feedback)
             return (np.empty(0, dtype=np.int64), np.empty(0, dtype=np.int64),
                     np.empty(0, dtype=np.int64))
 
@@ -271,6 +307,67 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
 
         order = np.argsort(seed_row, kind="stable")
         return seed_row[order], seed_col[order], seed_id[order]
+
+    @staticmethod
+    def _seed_id(feature, id_field, index):
+        if not id_field:
+            return index + 1
+        try:
+            value = feature[id_field]
+            return index + 1 if value is None else int(value)
+        except (KeyError, TypeError, ValueError):
+            return index + 1
+
+    def _report_extent_mismatch(self, source, layer, geotransform, reader,
+                                feedback):
+        """1 点も採用されなかったとき, 範囲の食い違いをログに出す."""
+        feedback.pushWarning(self.tr(
+            "有効な樹頂点がありません。樹頂点と CHM の範囲を確認してください。"))
+        extent = source.sourceExtent()
+        feedback.pushInfo(self.tr("樹頂点の範囲: %s (%s)")
+                          % (extent.toString(2), source.sourceCrs().authid()))
+        right = geotransform[0] + reader.width * geotransform[1]
+        bottom = geotransform[3] + reader.height * geotransform[5]
+        feedback.pushInfo(self.tr("CHM の範囲: %.2f, %.2f - %.2f, %.2f (%s)")
+                          % (geotransform[0], bottom, right, geotransform[3],
+                             layer.crs().authid()))
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _wkb_roundtrip_works():
+        """自前で組んだ WKB を QgsGeometry が読めるか試す.
+
+        1 セル四方のポリゴンを作って面積が 1 になることを確認する。
+        """
+        try:
+            probe = polygonize.polygon_wkb(
+                [[(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0),
+                  (0.0, 0.0)]])
+            geometry = QgsGeometry()
+            geometry.fromWkb(probe)
+            return (not geometry.isEmpty()
+                    and abs(geometry.area() - 1.0) < 1e-6)
+        except Exception:  # noqa: BLE001 - 判定できなければ使わない
+            return False
+
+    @staticmethod
+    def _geometry_from_wkb(wkb):
+        geometry = QgsGeometry()
+        geometry.fromWkb(wkb)
+        return geometry
+
+    @staticmethod
+    def _geometry_from_rings(polygons):
+        """環の座標列から MultiPolygon を組み立てる (WKB を経由しない)."""
+        parts = []
+        for rings in polygons:
+            converted = [[QgsPointXY(float(x), float(y)) for x, y in ring]
+                         for ring in rings if len(ring) >= 4]
+            if converted:
+                parts.append(converted)
+        if not parts:
+            return None
+        return QgsGeometry.fromMultiPolygonXY(parts)
 
     # ------------------------------------------------------------------
     def _process_blocks(self, reader, sink, seed_row, seed_col, seed_id,
@@ -285,7 +382,24 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
             reader.width, reader.height, block_size)
         processed = 0
         written = 0
+        assigned_cells = 0
+        produced_shapes = 0
+        geometry_failures = 0
+        sink_failures = 0
         route_logged = False
+
+        # WKB 経路が使えるか先に確かめる。QgsGeometry.fromWkb は戻り値が無く,
+        # 失敗しても null ジオメトリになるだけなので, 黙って全件消える。
+        use_wkb = self._wkb_roundtrip_works()
+        if use_wkb:
+            feedback.pushInfo(self.tr("ジオメトリ生成: WKB 経路"))
+            build_geometry = self._geometry_from_wkb
+            run_polygonize = polygonize.polygonize
+        else:
+            feedback.pushWarning(self.tr(
+                "WKB の解釈に失敗したため, 座標列からジオメトリを組み立てます。"))
+            build_geometry = self._geometry_from_rings
+            run_polygonize = polygonize.polygonize_rings
 
         for window in raster_reader.iter_blocks(
                 reader.width, reader.height, block_size, halo):
@@ -359,16 +473,18 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                 geotransform[3] + window.read_row * geotransform[5],
                 geotransform[4], geotransform[5],
             )
-            shapes, route = polygonize.polygonize(labels, block_gt)
+            assigned_cells += int((labels > 0).sum())
+            shapes, route = run_polygonize(labels, block_gt)
+            produced_shapes += len(shapes)
             if not route_logged:
                 feedback.pushInfo(self.tr("ポリゴン化: %s") % route)
                 route_logged = True
 
             seed_heights = array[local_row, local_col]
-            for label, wkb in shapes.items():
-                geometry = QgsGeometry()
-                geometry.fromWkb(wkb)
-                if geometry.isEmpty():
+            for label, source_shape in shapes.items():
+                geometry = build_geometry(source_shape)
+                if geometry is None or geometry.isEmpty():
+                    geometry_failures += 1
                     continue
                 if not geometry.isMultipart():
                     geometry.convertToMultiType()
@@ -387,11 +503,26 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                     float(means[label]),
                     n_cells,
                 ])
-                sink.addFeature(feature, QgsFeatureSink.FastInsert)
-                written += 1
+                if not sink.addFeature(feature, QgsFeatureSink.FastInsert):
+                    sink_failures += 1
+                else:
+                    written += 1
 
             processed += 1
             feedback.setProgress(int(100.0 * processed / total))
 
-        feedback.pushInfo(
-            self.tr("樹冠 %d 個を出力しました。") % written)
+        feedback.pushInfo(self.tr(
+            "割当セル %d / ポリゴン %d / 出力 %d 件")
+            % (assigned_cells, produced_shapes, written))
+        if geometry_failures:
+            feedback.pushWarning(self.tr(
+                "ジオメトリを組み立てられなかった樹冠が %d 件あります。")
+                % geometry_failures)
+        if sink_failures:
+            feedback.pushWarning(self.tr(
+                "出力レイヤへの書き込みに失敗した樹冠が %d 件あります。")
+                % sink_failures)
+        if written == 0 and assigned_cells > 0:
+            feedback.pushWarning(self.tr(
+                "セルは樹冠に割り当てられましたが 1 件も出力されませんでした。"
+                "ポリゴン化の経路を確認してください。"))
