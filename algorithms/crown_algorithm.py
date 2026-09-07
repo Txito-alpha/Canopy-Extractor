@@ -6,6 +6,7 @@ import numpy as np
 from qgis.core import (
     QgsFeature,
     QgsFeatureSink,
+    QgsFillSymbol,
     QgsField,
     QgsFields,
     QgsCoordinateTransform,
@@ -14,6 +15,7 @@ from qgis.core import (
     QgsProcessing,
     QgsProcessingAlgorithm,
     QgsProcessingException,
+    QgsProcessingLayerPostProcessorInterface,
     QgsProcessingParameterBand,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
@@ -22,11 +24,43 @@ from qgis.core import (
     QgsProcessingParameterField,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterLayer,
+    QgsSingleSymbolRenderer,
+    QgsVectorLayer,
     QgsWkbTypes,
 )
 from qgis.PyQt.QtCore import QCoreApplication, QVariant
 
 from ..core import crown, polygonize, raster_reader
+
+
+class CrownStyler(QgsProcessingLayerPostProcessorInterface):
+    """出力レイヤに既定のスタイル (不透明度 50%) を適用する.
+
+    ポストプロセッサは QGIS 側から参照されるだけなので, Python 側で
+    参照を保持しておかないとガベージコレクトされてしまう。クラス変数に
+    持たせるのが Processing での定石。
+    """
+
+    instance = None
+
+    def postProcessLayer(self, layer, context, feedback):  # noqa: N802
+        if not isinstance(layer, QgsVectorLayer):
+            return
+        symbol = QgsFillSymbol.createSimple({
+            "color": "111,168,86",
+            "outline_color": "45,84,32",
+            "outline_width": "0.2",
+            "outline_width_unit": "MM",
+            "style": "solid",
+        })
+        symbol.setOpacity(0.5)
+        layer.setRenderer(QgsSingleSymbolRenderer(symbol))
+        layer.triggerRepaint()
+
+    @staticmethod
+    def create():
+        CrownStyler.instance = CrownStyler()
+        return CrownStyler.instance
 
 
 class CrownAlgorithm(QgsProcessingAlgorithm):
@@ -121,7 +155,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(
             self.MAX_RADIUS, self.tr("樹冠の最大半径 (m)"),
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=5.0, minValue=0.1))
+            defaultValue=10.0, minValue=0.1))
 
         self.addParameter(QgsProcessingParameterNumber(
             self.MIN_HEIGHT, self.tr("樹木とみなす最低高 (m)"),
@@ -131,7 +165,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(
             self.TH_SEED, self.tr("種の高さに対する割合 (領域拡張)"),
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=0.45, minValue=0.0, maxValue=1.0))
+            defaultValue=0.55, minValue=0.0, maxValue=1.0))
 
         self.addParameter(QgsProcessingParameterNumber(
             self.TH_CROWN, self.tr("領域平均高に対する割合 (領域拡張)"),
@@ -141,7 +175,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(QgsProcessingParameterNumber(
             self.EXCLUSION, self.tr("除去する高さの割合 (ボロノイ)"),
             type=QgsProcessingParameterNumber.Double,
-            defaultValue=0.3, minValue=0.0, maxValue=1.0))
+            defaultValue=0.30, minValue=0.0, maxValue=1.0))
 
         self.addParameter(QgsProcessingParameterBoolean(
             self.REQUIRE_CONNECTED,
@@ -167,7 +201,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         self.addParameter(shape)
 
         fill = QgsProcessingParameterBoolean(
-            self.FILL_HOLES, self.tr("樹冠内の穴を埋める"), defaultValue=True)
+            self.FILL_HOLES, self.tr("樹冠内の穴を埋める"), defaultValue=False)
         fill.setFlags(fill.flags() | QgsProcessingParameterBoolean.FlagAdvanced)
         self.addParameter(fill)
 
@@ -233,6 +267,10 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         if sink is None:
             raise QgsProcessingException(
                 self.invalidSinkError(parameters, self.OUTPUT))
+
+        if context.willLoadLayerOnCompletion(dest_id):
+            context.layerToLoadOnCompletionDetails(dest_id).setPostProcessor(
+                CrownStyler.create())
 
         reader = raster_reader.open_reader(layer, band, feedback)
         try:

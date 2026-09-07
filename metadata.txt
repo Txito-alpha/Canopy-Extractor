@@ -3,7 +3,7 @@ name=Canopy Extractor
 qgisMinimumVersion=3.22
 description=Extracts tree tops and individual tree crown polygons from a CHM raster using single-pass numpy algorithms.
 about=CHM (Canopy Height Model) から局所最大値法で樹頂点を抽出し、Dalponte & Coomes (2016) の領域拡張または Silva et al. (2016) のボロノイ分割で単木の樹冠ポリゴンを作成します。GRASS / GDAL のアルゴリズム連鎖と中間ファイルを使わず、numpy の配列演算で完結します。numpy は QGIS に同梱されています。scipy があれば自動的に使用しますが、無くても主要機能は動作します。
-version=0.4.0
+version=0.4.2
 author=Hokkaido IT Team
 email=
 
@@ -17,7 +17,14 @@ icon=
 experimental=True
 deprecated=False
 
-changelog=0.4.0
+changelog=0.4.2
+    - 詳細パラメータ「樹冠内の穴を埋める」の既定を OFF に変更
+  0.4.1
+    - 樹冠ポリゴンの出力レイヤに既定スタイルを適用 (塗り不透明度 50%)
+    - 既定値の変更: 樹冠の最大半径 5.0 -> 10.0 m、
+      種の高さに対する割合 0.45 -> 0.55
+      (樹木とみなす最低高 2.0 m、除去する高さの割合 0.30 は据え置き)
+  0.4.0
     - 分割方式の既定をボロノイ (Silva) に変更
     - 「樹冠を樹頂点と連結した部分に限る」オプションを追加 (既定 ON)
       ボロノイが林道や無立木地のギャップを飛び越えるのを防ぐ
