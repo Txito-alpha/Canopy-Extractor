@@ -274,6 +274,65 @@ def crown_statistics(chm, labels, n_seed):
     return counts, maxima, means
 
 
+def enforce_connectivity(labels, seed_rows, seed_cols, max_cr=10):
+    """各樹冠を, 種と 4 連結でつながっている部分だけに絞り込む.
+
+    ボロノイは距離だけで割り当てるため, 林道や無立木地のギャップを飛び越えて
+    向こう側のセルを樹冠に取り込むことがある。種から到達できないセルを
+    落とすことで, 高さの条件で穴が空いた部分の先が樹冠に含まれなくなる。
+
+    領域拡張は元から連結なので影響しない (冪等)。
+    """
+    height, width = labels.shape
+    flat = labels.ravel()
+    keep = np.zeros(flat.size, dtype=bool)
+
+    seed_rows = np.asarray(seed_rows, dtype=np.int64)
+    seed_cols = np.asarray(seed_cols, dtype=np.int64)
+    if seed_rows.size == 0:
+        return np.zeros_like(labels)
+
+    seed_flat = seed_rows * width + seed_cols
+    assigned = flat[seed_flat] > 0
+    frontier = seed_flat[assigned]
+    if frontier.size == 0:
+        return np.zeros_like(labels)
+    keep[frontier] = True
+
+    # 樹冠は凹みうるので, 測地距離は max_cr より長くなることがある
+    for _ in range(4 * int(max_cr) + 4):
+        if frontier.size == 0:
+            break
+        frontier_row = frontier // width
+        frontier_col = frontier % width
+        frontier_label = flat[frontier]
+
+        cand_index = []
+        cand_label = []
+        for d_row, d_col in _NEIGHBOURS:
+            near_row = frontier_row + d_row
+            near_col = frontier_col + d_col
+            inside = ((near_row >= 0) & (near_row < height)
+                      & (near_col >= 0) & (near_col < width))
+            if not inside.any():
+                continue
+            cand_index.append(near_row[inside] * width + near_col[inside])
+            cand_label.append(frontier_label[inside])
+        if not cand_index:
+            break
+
+        index = np.concatenate(cand_index)
+        label = np.concatenate(cand_label)
+        reachable = (~keep[index]) & (flat[index] == label)
+        index = np.unique(index[reachable])
+        if index.size == 0:
+            break
+        keep[index] = True
+        frontier = index
+
+    return np.where(keep, flat, 0).astype(np.int32).reshape(height, width)
+
+
 def backend_description():
     """使用中のバックエンドを説明する文字列 (ログ出力用)."""
     return ("穴埋め: scipy.ndimage" if _ndimage is not None

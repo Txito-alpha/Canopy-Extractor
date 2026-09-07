@@ -232,6 +232,11 @@ class TestTiling(unittest.TestCase):
     def _voronoi(block, rows, cols, max_cr):
         return crown.voronoi_crowns(block, rows, cols, max_cr=max_cr)
 
+    @staticmethod
+    def _voronoi_connected(block, rows, cols, max_cr):
+        labels = crown.voronoi_crowns(block, rows, cols, max_cr=max_cr)
+        return crown.enforce_connectivity(labels, rows, cols, max_cr)
+
     def _check(self, method, spacing, seed):
         chm, rows, cols = synthetic_stand(
             240, spacing, crown_radius=9.0, seed=seed)
@@ -259,6 +264,11 @@ class TestTiling(unittest.TestCase):
     def test_voronoi_dense(self):
         for seed in (0, 1, 2, 3, 4):
             self._check(self._voronoi, 10, seed)
+
+    def test_voronoi_connected_dense(self):
+        """連結性を入れてもタイル分割が全域処理と一致すること."""
+        for seed in (0, 1, 2, 3, 4):
+            self._check(self._voronoi_connected, 10, seed)
 
     def test_insufficient_halo_is_detected(self):
         """halo = max_cr では一致しないこと (定数の根拠を残す回帰テスト)."""
@@ -542,3 +552,76 @@ class TestGdalPolygonizeFailure(unittest.TestCase):
         shapes, route = polygonize.polygonize_rings(self.labels, self.gt)
         self.assertEqual(set(shapes), {1})
         self.assertIn("numpy", route)
+
+
+class TestConnectivity(unittest.TestCase):
+    """ギャップを飛び越えた割当が落とせること."""
+
+    def test_gap_is_not_bridged(self):
+        """ボロノイが林道状のギャップの向こう側を取り込まないこと."""
+        chm = np.full((41, 41), 20.0, dtype=np.float32)
+        chm[:, 24:27] = 0.0          # 幅 3 セルの無立木帯
+        seed_rows = np.array([20])
+        seed_cols = np.array([20])
+
+        labels = crown.voronoi_crowns(
+            chm, seed_rows, seed_cols, max_cr=15, exclusion=0.0, th_tree=2.0)
+        # ギャップの向こう側が割り当てられてしまう
+        self.assertGreater(int((labels[:, 27:] > 0).sum()), 0)
+
+        connected = crown.enforce_connectivity(
+            labels, seed_rows, seed_cols, max_cr=15)
+        self.assertEqual(int((connected[:, 27:] > 0).sum()), 0)
+        # 手前側は残る
+        self.assertGreater(int((connected[:, :24] > 0).sum()), 0)
+
+    def test_region_growing_is_unchanged(self):
+        """領域拡張は元から連結なので冪等であること."""
+        chm, rows, cols = synthetic_stand(120, 14)
+        order = np.argsort(rows, kind="stable")
+        seed_rows, seed_cols = rows[order], cols[order]
+        labels = crown.grow_region(chm, seed_rows, seed_cols, max_cr=8)
+        connected = crown.enforce_connectivity(
+            labels, seed_rows, seed_cols, max_cr=8)
+        np.testing.assert_array_equal(connected, labels)
+
+    def test_seed_cell_is_kept(self):
+        chm = np.full((21, 21), 20.0, dtype=np.float32)
+        seed_rows = np.array([10])
+        seed_cols = np.array([10])
+        labels = crown.voronoi_crowns(
+            chm, seed_rows, seed_cols, max_cr=6, exclusion=0.0, th_tree=2.0)
+        connected = crown.enforce_connectivity(
+            labels, seed_rows, seed_cols, max_cr=6)
+        self.assertEqual(int(connected[10, 10]), 1)
+
+    def test_no_seeds(self):
+        labels = np.zeros((10, 10), dtype=np.int32)
+        empty = np.empty(0, dtype=np.int64)
+        result = crown.enforce_connectivity(labels, empty, empty, max_cr=5)
+        self.assertEqual(int(result.sum()), 0)
+
+
+class TestMaskExclusion(unittest.TestCase):
+    """立木地マスクによる除外 (valid 引数経由)."""
+
+    def test_masked_cells_are_excluded(self):
+        chm = np.full((41, 41), 20.0, dtype=np.float32)
+        valid = np.ones(chm.shape, dtype=bool)
+        valid[:, 25:] = False        # 無立木地扱い
+
+        labels = crown.voronoi_crowns(
+            chm, np.array([20]), np.array([20]), max_cr=15,
+            exclusion=0.0, th_tree=2.0, valid=valid)
+        self.assertEqual(int((labels[:, 25:] > 0).sum()), 0)
+        self.assertGreater(int((labels[:, :25] > 0).sum()), 0)
+
+    def test_region_growing_respects_mask(self):
+        chm = np.full((41, 41), 20.0, dtype=np.float32)
+        valid = np.ones(chm.shape, dtype=bool)
+        valid[:, 25:] = False
+
+        labels = crown.grow_region(
+            chm, np.array([20]), np.array([20]), max_cr=15,
+            shape=crown.SHAPE_SQUARE, valid=valid)
+        self.assertEqual(int((labels[:, 25:] > 0).sum()), 0)

@@ -41,6 +41,10 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
     TH_SEED = "TH_SEED"
     TH_CROWN = "TH_CROWN"
     EXCLUSION = "EXCLUSION"
+    REQUIRE_CONNECTED = "REQUIRE_CONNECTED"
+    MASK = "MASK"
+    MASK_BAND = "MASK_BAND"
+    MASK_INVERT = "MASK_INVERT"
     MAX_RADIUS = "MAX_RADIUS"
     SHAPE = "SHAPE"
     FILL_HOLES = "FILL_HOLES"
@@ -68,11 +72,19 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
     def shortHelpString(self):
         return self.tr(
             "樹頂点ポイントと CHM から, 単木ごとの樹冠ポリゴンを作成します。\n\n"
+            "【ボロノイ】Silva et al. (2016) の方式 (既定)。最大半径を切った"
+            "最近傍割当で, 低いセルを除去します。単純で速く, 樹冠の大きさが"
+            "揃うため樹冠投影面積の集計には扱いやすい方式です。\n\n"
             "【領域拡張】Dalponte & Coomes (2016) の方式。樹頂点を種として"
-            "4 近傍へ条件付きで広げます。樹冠の形が CHM の起伏に沿うため, "
-            "針葉樹人工林では概ね良好な結果になります。\n\n"
-            "【ボロノイ】Silva et al. (2016) の方式。最大半径を切った最近傍割当で, "
-            "低いセルを除去します。単純で速いぶん, 樹冠の形は幾何的になります。\n\n"
+            "4 近傍へ条件付きで広げます。樹冠の形が CHM の起伏に沿います。\n\n"
+            "【無立木地の除外】3 段階で効かせられます。\n"
+            "1. 樹木とみなす最低高: この高さに満たないセルは樹冠に入りません。\n"
+            "2. 樹頂点と連結した部分に限る: 林道や無立木地のギャップを飛び越えて"
+            "向こう側のセルを取り込むのを防ぎます。ボロノイは距離だけで割り当てる"
+            "ため, この指定が効きます。\n"
+            "3. 立木地マスク: 立木地を 0 以外, 無立木地を 0 か NoData とした"
+            "ラスタを指定すると, そのセルを樹冠から除外します。小班界などの"
+            "ポリゴンをラスタ化したものも使えます。\n\n"
             "樹冠の最大半径はメートルで指定します (内部でセル数に換算)。"
             "どちらの方式も樹冠が種から一定距離内に収まるため, タイル分割しても"
             "ポリゴンが境界で分断されることはありません。\n\n"
@@ -104,7 +116,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
             self.METHOD, self.tr("分割方式"),
             options=[self.tr("領域拡張 (Dalponte)"),
                      self.tr("ボロノイ (Silva)")],
-            defaultValue=0))
+            defaultValue=1))
 
         self.addParameter(QgsProcessingParameterNumber(
             self.MAX_RADIUS, self.tr("樹冠の最大半径 (m)"),
@@ -130,6 +142,22 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
             self.EXCLUSION, self.tr("除去する高さの割合 (ボロノイ)"),
             type=QgsProcessingParameterNumber.Double,
             defaultValue=0.3, minValue=0.0, maxValue=1.0))
+
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.REQUIRE_CONNECTED,
+            self.tr("樹冠を樹頂点と連結した部分に限る"), defaultValue=True))
+
+        self.addParameter(QgsProcessingParameterRasterLayer(
+            self.MASK, self.tr("立木地マスク (任意)"), optional=True))
+
+        self.addParameter(QgsProcessingParameterBand(
+            self.MASK_BAND, self.tr("マスクのバンド"),
+            parentLayerParameterName=self.MASK, defaultValue=1,
+            optional=True))
+
+        self.addParameter(QgsProcessingParameterBoolean(
+            self.MASK_INVERT, self.tr("マスクの意味を反転する"),
+            defaultValue=False))
 
         shape = QgsProcessingParameterEnum(
             self.SHAPE, self.tr("樹冠の広がり方"),
@@ -181,6 +209,13 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         shape = (crown.SHAPE_CIRCLE, crown.SHAPE_SQUARE)[
             self.parameterAsEnum(parameters, self.SHAPE, context)]
         do_fill = self.parameterAsBool(parameters, self.FILL_HOLES, context)
+        require_connected = self.parameterAsBool(
+            parameters, self.REQUIRE_CONNECTED, context)
+        mask_layer = self.parameterAsRasterLayer(
+            parameters, self.MASK, context)
+        mask_band = self.parameterAsInt(parameters, self.MASK_BAND, context)
+        mask_invert = self.parameterAsBool(
+            parameters, self.MASK_INVERT, context)
         block_size = self.parameterAsInt(parameters, self.BLOCK_SIZE, context)
 
         fields = QgsFields()
@@ -219,6 +254,20 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                     "scipy が無いため穴埋めをスキップします。"))
                 do_fill = False
 
+            mask_sampler = None
+            if mask_layer is not None:
+                if mask_layer.crs() != layer.crs():
+                    feedback.pushWarning(self.tr(
+                        "マスクの CRS (%s) が CHM (%s) と異なります。"
+                        "再投影は行いません。")
+                        % (mask_layer.crs().authid(), layer.crs().authid()))
+                mask_sampler = raster_reader.MaskSampler(
+                    mask_layer, mask_band)
+                feedback.pushInfo(self.tr(
+                    "立木地マスクを使用します (%s%s)")
+                    % (mask_layer.name(),
+                       self.tr(", 反転") if mask_invert else ""))
+
             seeds = self._read_seeds(
                 source, layer, geotransform, reader, id_field, context,
                 feedback)
@@ -231,7 +280,8 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
             self._process_blocks(
                 reader, sink, seed_row, seed_col, seed_id, geotransform,
                 cell_area, method, max_cr, min_height, th_seed, th_crown,
-                exclusion, shape, do_fill, block_size, feedback)
+                exclusion, shape, do_fill, require_connected, mask_sampler,
+                mask_invert, block_size, feedback)
         finally:
             reader.close()
 
@@ -373,6 +423,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
     def _process_blocks(self, reader, sink, seed_row, seed_col, seed_id,
                         geotransform, cell_area, method, max_cr, min_height,
                         th_seed, th_crown, exclusion, shape, do_fill,
+                        require_connected, mask_sampler, mask_invert,
                         block_size, feedback):
         # ある樹冠のセルを奪いうる競合の種は, 種から最大 2 * max_cr 離れている。
         # (セルは種から max_cr 以内, 競合はそのセルから max_cr 以内)
@@ -386,6 +437,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         produced_shapes = 0
         geometry_failures = 0
         sink_failures = 0
+        excluded_seeds = 0
         route_logged = False
 
         # WKB 経路が使えるか先に確かめる。QgsGeometry.fromWkb は戻り値が無く,
@@ -431,6 +483,20 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
             if reader.nodata is not None and np.isfinite(reader.nodata):
                 valid &= array != np.float32(reader.nodata)
 
+            if mask_sampler is not None:
+                try:
+                    valid &= mask_sampler.valid_mask(
+                        window, geotransform, mask_invert)
+                except Exception as error:  # noqa: BLE001
+                    raise QgsProcessingException(self.tr(
+                        "立木地マスクを読めません: %s") % error)
+                masked_seeds = valid[local_row, local_col]
+                if not masked_seeds.any():
+                    processed += 1
+                    feedback.setProgress(int(100.0 * processed / total))
+                    continue
+                excluded_seeds += int((~masked_seeds).sum())
+
             if method == crown.METHOD_REGION_GROWING:
                 labels = crown.grow_region(
                     array, local_row, local_col, th_tree=min_height,
@@ -441,6 +507,10 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                     array, local_row, local_col, max_cr=max_cr,
                     exclusion=exclusion, th_tree=min_height, shape=shape,
                     valid=valid)
+
+            if require_connected:
+                labels = crown.enforce_connectivity(
+                    labels, local_row, local_col, max_cr)
 
             if do_fill:
                 labels = crown.fill_holes(labels)
@@ -514,6 +584,9 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         feedback.pushInfo(self.tr(
             "割当セル %d / ポリゴン %d / 出力 %d 件")
             % (assigned_cells, produced_shapes, written))
+        if excluded_seeds:
+            feedback.pushInfo(self.tr(
+                "マスクにより除外された樹頂点: 延べ %d 点") % excluded_seeds)
         if geometry_failures:
             feedback.pushWarning(self.tr(
                 "ジオメトリを組み立てられなかった樹冠が %d 件あります。")

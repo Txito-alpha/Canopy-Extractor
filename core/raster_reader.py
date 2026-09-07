@@ -206,6 +206,57 @@ def _numpy_dtype(qgis_data_type):
     return mapping[qgis_data_type]
 
 
+class MaskSampler(object):
+    """CHM のブロックと同じ格子でマスクラスタを読むためのラッパ.
+
+    QGIS のラスタプロバイダは範囲とサイズを指定して読めるので, マスクの
+    セルサイズが CHM と違っていても最近傍で合わせてくれる。
+    CRS が違う場合は再投影されないので, 呼び出し側で警告する。
+    """
+
+    def __init__(self, layer, band=1):
+        self.layer = layer
+        self.provider = layer.dataProvider()
+        self.band = band
+        self.nodata = None
+        if self.provider.sourceHasNoDataValue(band):
+            self.nodata = self.provider.sourceNoDataValue(band)
+
+    def read(self, window, geotransform):
+        """CHM の読み出し窓に対応するマスク値を float32 配列で返す."""
+        from qgis.core import QgsRectangle
+
+        x_size = geotransform[1]
+        y_size = geotransform[5]
+        x_min = geotransform[0] + window.read_col * x_size
+        x_max = geotransform[0] + (window.read_col + window.read_width) * x_size
+        y_top = geotransform[3] + window.read_row * y_size
+        y_bottom = geotransform[3] + (
+            window.read_row + window.read_height) * y_size
+
+        rectangle = QgsRectangle(
+            min(x_min, x_max), min(y_top, y_bottom),
+            max(x_min, x_max), max(y_top, y_bottom))
+
+        block = self.provider.block(
+            self.band, rectangle, window.read_width, window.read_height)
+        if block is None or not block.isValid():
+            raise IOError("マスクラスタのブロックを読めません。")
+
+        array = np.frombuffer(
+            bytes(block.data()), dtype=_numpy_dtype(block.dataType()))
+        return array.reshape(
+            window.read_height, window.read_width).astype(np.float32)
+
+    def valid_mask(self, window, geotransform, invert=False):
+        """有効セル (マスクが 0 でも NoData でもない) の真偽配列を返す."""
+        values = self.read(window, geotransform)
+        valid = np.isfinite(values) & (values != 0)
+        if self.nodata is not None and np.isfinite(self.nodata):
+            valid &= values != np.float32(self.nodata)
+        return ~valid if invert else valid
+
+
 def open_reader(layer, band=1, feedback=None):
     """QgsRasterLayer からリーダを作る. GDAL 優先, 失敗したらプロバイダ経由.
 
