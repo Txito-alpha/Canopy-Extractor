@@ -39,14 +39,31 @@ class BlockWindow(object):
                 slice(col0, col0 + self.core_width))
 
 
-def iter_blocks(width, height, block_size, halo):
-    """ラスタ全体を halo 付きブロックに分割して yield する."""
-    for row in range(0, height, block_size):
-        core_height = min(block_size, height - row)
+def iter_blocks(width, height, block_size, halo, region=None):
+    """ラスタを halo 付きブロックに分割して yield する.
+
+    Args:
+        width, height: ラスタ全体のセル数 (halo の読み出しはこの範囲に
+            クリップされる)
+        block_size: コアブロックの一辺のセル数
+        halo: コアの周囲に追加で読む幅 (セル数)
+        region: 処理対象を絞る場合の (col0, row0, region_width, region_height)。
+            None ならラスタ全体を対象にする。ブロックはこの範囲内だけを
+            走査するが, halo による読み出しは region の外, ラスタ全体の
+            範囲までは及んでよい (境界付近の計算精度を落とさないため)。
+    """
+    if region is None:
+        origin_col, origin_row = 0, 0
+        region_width, region_height = width, height
+    else:
+        origin_col, origin_row, region_width, region_height = region
+
+    for row in range(origin_row, origin_row + region_height, block_size):
+        core_height = min(block_size, origin_row + region_height - row)
         read_row = max(0, row - halo)
         read_bottom = min(height, row + core_height + halo)
-        for col in range(0, width, block_size):
-            core_width = min(block_size, width - col)
+        for col in range(origin_col, origin_col + region_width, block_size):
+            core_width = min(block_size, origin_col + region_width - col)
             read_col = max(0, col - halo)
             read_right = min(width, col + core_width + halo)
             yield BlockWindow(
@@ -56,7 +73,9 @@ def iter_blocks(width, height, block_size, halo):
             )
 
 
-def count_blocks(width, height, block_size):
+def count_blocks(width, height, block_size, region=None):
+    if region is not None:
+        _, _, width, height = region
     rows = (height + block_size - 1) // block_size
     cols = (width + block_size - 1) // block_size
     return rows * cols
@@ -255,6 +274,125 @@ class MaskSampler(object):
         if self.nodata is not None and np.isfinite(self.nodata):
             valid &= values != np.float32(self.nodata)
         return ~valid if invert else valid
+
+
+def extent_to_region(geotransform, raster_width, raster_height,
+                     x_min, y_min, x_max, y_max):
+    """地図座標の範囲をピクセル範囲 (col0, row0, width, height) に変換する.
+
+    ラスタが北が上 (回転無し, geotransform[2] == geotransform[4] == 0) で
+    あることを前提にする。本プラグインが扱う CHM はすべてこの形式。
+
+    範囲がラスタと重ならない場合は None を返す。
+    """
+    gt = geotransform
+    x_size = gt[1]
+    y_size = gt[5]  # 通常は負値
+
+    col0 = int(np.floor((x_min - gt[0]) / x_size))
+    col1 = int(np.ceil((x_max - gt[0]) / x_size))
+    # y_size が負値なので, y の大小関係を反転させて row に変換する
+    row0 = int(np.floor((y_max - gt[3]) / y_size))
+    row1 = int(np.ceil((y_min - gt[3]) / y_size))
+
+    col0 = max(0, col0)
+    row0 = max(0, row0)
+    col1 = min(raster_width, col1)
+    row1 = min(raster_height, row1)
+
+    if col1 <= col0 or row1 <= row0:
+        return None
+    return (col0, row0, col1 - col0, row1 - row0)
+
+
+class AreaRasterizer(object):
+    """ポリゴンレイヤをブロックごとにラスタ化し, 有効セルのマスクを作る.
+
+    gdal.RasterizeLayer を使う。gdal.Polygonize と同じく MEM ドライバ +
+    ReadRaster 経由なので osgeo.gdal_array を通らない。
+
+    ポリゴンの CRS が CHM と違う場合は, 構築時に一括で座標変換してから
+    OGR メモリレイヤに積む (ブロックごとの変換は行わない)。
+    """
+
+    def __init__(self, source, target_crs, transform_context,
+                 all_touched=False):
+        from osgeo import ogr
+        from qgis.core import QgsCoordinateTransform
+
+        transform = None
+        source_crs = source.sourceCrs()
+        if (source_crs.isValid() and target_crs.isValid()
+                and source_crs != target_crs):
+            transform = QgsCoordinateTransform(
+                source_crs, target_crs, transform_context)
+
+        driver = ogr.GetDriverByName("Memory")
+        self._datasource = driver.CreateDataSource("area")
+        self._layer = self._datasource.CreateLayer(
+            "area", None, ogr.wkbMultiPolygon)
+        self._all_touched = all_touched
+        self.feature_count = 0
+
+        for feature in source.getFeatures():
+            geometry = feature.geometry()
+            if geometry is None or geometry.isNull() or geometry.isEmpty():
+                continue
+            if transform is not None:
+                if geometry.transform(transform) != 0:
+                    continue
+            ogr_geometry = ogr.CreateGeometryFromWkt(geometry.asWkt())
+            if ogr_geometry is None:
+                continue
+            ogr_feature = ogr.Feature(self._layer.GetLayerDefn())
+            ogr_feature.SetGeometry(ogr_geometry)
+            self._layer.CreateFeature(ogr_feature)
+            self.feature_count += 1
+
+    def valid_mask(self, window, geotransform):
+        """window の読み出し範囲について, ポリゴン内側の真偽配列を返す."""
+        from osgeo import gdal
+
+        if self.feature_count == 0:
+            return np.zeros((window.read_height, window.read_width),
+                            dtype=bool)
+
+        block_gt = (
+            geotransform[0] + window.read_col * geotransform[1],
+            geotransform[1], geotransform[2],
+            geotransform[3] + window.read_row * geotransform[5],
+            geotransform[4], geotransform[5],
+        )
+
+        driver = gdal.GetDriverByName("MEM")
+        dataset = driver.Create(
+            "", window.read_width, window.read_height, 1, gdal.GDT_Byte)
+        if dataset is None:
+            raise IOError("MEM ラスタを作成できません。")
+        dataset.SetGeoTransform(block_gt)
+
+        x_min = block_gt[0]
+        x_max = block_gt[0] + window.read_width * block_gt[1]
+        y_max = block_gt[3]
+        y_min = block_gt[3] + window.read_height * block_gt[5]
+        self._layer.SetSpatialFilterRect(
+            min(x_min, x_max), min(y_min, y_max),
+            max(x_min, x_max), max(y_min, y_max))
+
+        options = ["ALL_TOUCHED=%s" % ("TRUE" if self._all_touched
+                                       else "FALSE")]
+        status = gdal.RasterizeLayer(
+            dataset, [1], self._layer, burn_values=[1], options=options)
+        self._layer.SetSpatialFilter(None)
+        if status != 0:
+            raise IOError("gdal.RasterizeLayer が失敗しました (code %s)"
+                          % status)
+
+        raw = dataset.GetRasterBand(1).ReadRaster(
+            0, 0, window.read_width, window.read_height)
+        array = np.frombuffer(raw, dtype=np.uint8).reshape(
+            window.read_height, window.read_width)
+        return array > 0
 
 
 def open_reader(layer, band=1, feedback=None):

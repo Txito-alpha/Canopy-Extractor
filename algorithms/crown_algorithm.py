@@ -20,6 +20,7 @@ from qgis.core import (
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterExtent,
     QgsProcessingParameterFeatureSource,
     QgsProcessingParameterField,
     QgsProcessingParameterNumber,
@@ -79,6 +80,8 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
     MASK = "MASK"
     MASK_BAND = "MASK_BAND"
     MASK_INVERT = "MASK_INVERT"
+    EXTENT = "EXTENT"
+    AREA = "AREA"
     MAX_RADIUS = "MAX_RADIUS"
     SHAPE = "SHAPE"
     FILL_HOLES = "FILL_HOLES"
@@ -119,6 +122,11 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
             "3. 立木地マスク: 立木地を 0 以外, 無立木地を 0 か NoData とした"
             "ラスタを指定すると, そのセルを樹冠から除外します。小班界などの"
             "ポリゴンをラスタ化したものも使えます。\n\n"
+            "【処理範囲】\n"
+            "「処理範囲」でキャンバスの表示範囲や座標を指定すると, その範囲だけを"
+            "処理します。「処理範囲ポリゴン」でポリゴンレイヤを指定すると, "
+            "ポリゴンの外側にあるセルをすべて無立木地扱いにして樹冠から除外します"
+            "(立木地マスクと同じ扱いで, 内部でラスタ化して使います)。\n\n"
             "樹冠の最大半径はメートルで指定します (内部でセル数に換算)。"
             "どちらの方式も樹冠が種から一定距離内に収まるため, タイル分割しても"
             "ポリゴンが境界で分断されることはありません。\n\n"
@@ -193,6 +201,15 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
             self.MASK_INVERT, self.tr("マスクの意味を反転する"),
             defaultValue=False))
 
+        extent = QgsProcessingParameterExtent(
+            self.EXTENT, self.tr("処理範囲 (任意)"), optional=True)
+        self.addParameter(extent)
+
+        area = QgsProcessingParameterFeatureSource(
+            self.AREA, self.tr("処理範囲ポリゴン (任意)"),
+            [QgsProcessing.TypeVectorPolygon], optional=True)
+        self.addParameter(area)
+
         shape = QgsProcessingParameterEnum(
             self.SHAPE, self.tr("樹冠の広がり方"),
             options=[self.tr("円形"), self.tr("正方形 (原著と同じ)")],
@@ -250,6 +267,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
         mask_band = self.parameterAsInt(parameters, self.MASK_BAND, context)
         mask_invert = self.parameterAsBool(
             parameters, self.MASK_INVERT, context)
+        area_source = self.parameterAsSource(parameters, self.AREA, context)
         block_size = self.parameterAsInt(parameters, self.BLOCK_SIZE, context)
 
         fields = QgsFields()
@@ -306,6 +324,37 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                     % (mask_layer.name(),
                        self.tr(", 反転") if mask_invert else ""))
 
+            region = None
+            extent = self.parameterAsExtent(
+                parameters, self.EXTENT, context, layer.crs())
+            if not extent.isNull():
+                region = raster_reader.extent_to_region(
+                    geotransform, reader.width, reader.height,
+                    extent.xMinimum(), extent.yMinimum(),
+                    extent.xMaximum(), extent.yMaximum())
+                if region is None:
+                    raise QgsProcessingException(
+                        self.tr("処理範囲が CHM の範囲と重なりません。"))
+                feedback.pushInfo(self.tr(
+                    "処理範囲: 列 %d-%d, 行 %d-%d (%d x %d セル)")
+                    % (region[0], region[0] + region[2],
+                       region[1], region[1] + region[3],
+                       region[2], region[3]))
+
+            area_rasterizer = None
+            if area_source is not None:
+                area_rasterizer = raster_reader.AreaRasterizer(
+                    area_source, layer.crs(), context.transformContext())
+                if area_rasterizer.feature_count == 0:
+                    feedback.pushWarning(self.tr(
+                        "処理範囲ポリゴンに有効なフィーチャがありません。"
+                        "無視します。"))
+                    area_rasterizer = None
+                else:
+                    feedback.pushInfo(self.tr(
+                        "処理範囲ポリゴンを使用します (%d フィーチャ)")
+                        % area_rasterizer.feature_count)
+
             seeds = self._read_seeds(
                 source, layer, geotransform, reader, id_field, context,
                 feedback)
@@ -319,7 +368,7 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                 reader, sink, seed_row, seed_col, seed_id, geotransform,
                 cell_area, method, max_cr, min_height, th_seed, th_crown,
                 exclusion, shape, do_fill, require_connected, mask_sampler,
-                mask_invert, block_size, feedback)
+                mask_invert, area_rasterizer, region, block_size, feedback)
         finally:
             reader.close()
 
@@ -462,13 +511,13 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                         geotransform, cell_area, method, max_cr, min_height,
                         th_seed, th_crown, exclusion, shape, do_fill,
                         require_connected, mask_sampler, mask_invert,
-                        block_size, feedback):
+                        area_rasterizer, region, block_size, feedback):
         # ある樹冠のセルを奪いうる競合の種は, 種から最大 2 * max_cr 離れている。
         # (セルは種から max_cr 以内, 競合はそのセルから max_cr 以内)
         # halo を max_cr にすると密な林分でタイル境界付近の帰属がずれる。
         halo = 2 * max_cr + 1
         total = raster_reader.count_blocks(
-            reader.width, reader.height, block_size)
+            reader.width, reader.height, block_size, region=region)
         processed = 0
         written = 0
         assigned_cells = 0
@@ -492,7 +541,8 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
             run_polygonize = polygonize.polygonize_rings
 
         for window in raster_reader.iter_blocks(
-                reader.width, reader.height, block_size, halo):
+                reader.width, reader.height, block_size, halo,
+                region=region):
             if feedback.isCanceled():
                 return
 
@@ -528,6 +578,19 @@ class CrownAlgorithm(QgsProcessingAlgorithm):
                 except Exception as error:  # noqa: BLE001
                     raise QgsProcessingException(self.tr(
                         "立木地マスクを読めません: %s") % error)
+                masked_seeds = valid[local_row, local_col]
+                if not masked_seeds.any():
+                    processed += 1
+                    feedback.setProgress(int(100.0 * processed / total))
+                    continue
+                excluded_seeds += int((~masked_seeds).sum())
+
+            if area_rasterizer is not None:
+                try:
+                    valid &= area_rasterizer.valid_mask(window, geotransform)
+                except Exception as error:  # noqa: BLE001
+                    raise QgsProcessingException(self.tr(
+                        "処理範囲ポリゴンをラスタ化できません: %s") % error)
                 masked_seeds = valid[local_row, local_col]
                 if not masked_seeds.any():
                     processed += 1

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 from qgis.core import (
+    QgsCoordinateTransform,
     QgsFeature,
     QgsFeatureSink,
     QgsField,
@@ -16,7 +17,9 @@ from qgis.core import (
     QgsProcessingParameterBand,
     QgsProcessingParameterBoolean,
     QgsProcessingParameterEnum,
+    QgsProcessingParameterExtent,
     QgsProcessingParameterFeatureSink,
+    QgsProcessingParameterFeatureSource,
     QgsProcessingParameterNumber,
     QgsProcessingParameterRasterLayer,
     QgsWkbTypes,
@@ -38,6 +41,8 @@ class TreeTopAlgorithm(QgsProcessingAlgorithm):
     SMOOTH_SIZE = "SMOOTH_SIZE"
     SMOOTH_SIGMA = "SMOOTH_SIGMA"
     HEIGHT_SOURCE = "HEIGHT_SOURCE"
+    EXTENT = "EXTENT"
+    AREA = "AREA"
     BLOCK_SIZE = "BLOCK_SIZE"
     OUTPUT = "OUTPUT"
 
@@ -75,6 +80,11 @@ class TreeTopAlgorithm(QgsProcessingAlgorithm):
             "平滑化は樹冠の頂点をわずかに削るため, 平滑化後の CHM から樹高を取ると"
             "系統的な過小評価になります。既定では極大の探索だけを平滑化後の面で行い, "
             "樹高は元の CHM から取得します。\n\n"
+            "【処理範囲】\n"
+            "「処理範囲」でキャンバスの表示範囲や座標を指定すると, その範囲だけを"
+            "処理します (範囲外の CHM は読み込みません)。「処理範囲ポリゴン」で"
+            "ポリゴンレイヤを指定すると, さらにポリゴンの内側にある樹頂点だけを"
+            "残します (小班界など, 矩形でない範囲を絞り込みたい場合)。\n\n"
             "処理はすべてメモリ上の配列演算で行うため, 中間ファイルは生成しません。"
         )
 
@@ -121,6 +131,15 @@ class TreeTopAlgorithm(QgsProcessingAlgorithm):
             options=[self.tr("元の CHM"), self.tr("平滑化後の CHM")],
             defaultValue=0))
 
+        extent = QgsProcessingParameterExtent(
+            self.EXTENT, self.tr("処理範囲 (任意)"), optional=True)
+        self.addParameter(extent)
+
+        area = QgsProcessingParameterFeatureSource(
+            self.AREA, self.tr("処理範囲ポリゴン (任意)"),
+            [QgsProcessing.TypeVectorPolygon], optional=True)
+        self.addParameter(area)
+
         block_size = QgsProcessingParameterNumber(
             self.BLOCK_SIZE, self.tr("処理ブロックサイズ (セル数)"),
             type=QgsProcessingParameterNumber.Integer,
@@ -156,6 +175,8 @@ class TreeTopAlgorithm(QgsProcessingAlgorithm):
         height_from_smoothed = self.parameterAsEnum(
             parameters, self.HEIGHT_SOURCE, context) == 1
 
+        area_source = self.parameterAsSource(parameters, self.AREA, context)
+
         if window_size % 2 == 0:
             raise QgsProcessingException(
                 self.tr("近傍窓のサイズは奇数で指定してください。"))
@@ -184,6 +205,28 @@ class TreeTopAlgorithm(QgsProcessingAlgorithm):
             self.tr("ラスタ %d x %d セル, セルサイズ %.3f, NoData=%s")
             % (reader.width, reader.height, cell_size, reader.nodata))
 
+        region = None
+        extent = self.parameterAsExtent(
+            parameters, self.EXTENT, context, layer.crs())
+        if not extent.isNull():
+            region = raster_reader.extent_to_region(
+                geotransform, reader.width, reader.height,
+                extent.xMinimum(), extent.yMinimum(),
+                extent.xMaximum(), extent.yMaximum())
+            if region is None:
+                reader.close()
+                raise QgsProcessingException(
+                    self.tr("処理範囲が CHM の範囲と重なりません。"))
+            feedback.pushInfo(self.tr(
+                "処理範囲: 列 %d-%d, 行 %d-%d (%d x %d セル)")
+                % (region[0], region[0] + region[2],
+                   region[1], region[1] + region[3], region[2], region[3]))
+
+        area_engine = None
+        if area_source is not None:
+            area_engine = self._build_area_engine(
+                area_source, layer.crs(), context, feedback)
+
         sigma_cells = 1.0
         if smooth_method == smoothing.METHOD_GAUSSIAN:
             if cell_size <= 0.0:
@@ -206,7 +249,7 @@ class TreeTopAlgorithm(QgsProcessingAlgorithm):
             rows, cols, heights, counts = self._scan(
                 reader, window_size, min_height, merge_plateaus,
                 block_size, smooth_method, smooth_size, sigma_cells,
-                height_from_smoothed, feedback)
+                height_from_smoothed, region, feedback)
         finally:
             reader.close()
 
@@ -217,21 +260,83 @@ class TreeTopAlgorithm(QgsProcessingAlgorithm):
             self.tr("樹頂点 %d 点を抽出しました。") % rows.size)
 
         xs, ys = local_maxima.cell_to_map(rows, cols, geotransform)
+
+        if area_engine is not None:
+            keep = self._filter_by_area(xs, ys, area_engine, feedback)
+            removed = int((~keep).sum())
+            if removed:
+                feedback.pushInfo(self.tr(
+                    "処理範囲ポリゴンの外にある樹頂点 %d 点を除外しました。")
+                    % removed)
+            xs, ys = xs[keep], ys[keep]
+            heights, counts = heights[keep], counts[keep]
+
         self._write(sink, xs, ys, heights, counts, feedback)
 
         return {self.OUTPUT: dest_id}
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _build_area_engine(area_source, target_crs, context, feedback):
+        """処理範囲ポリゴンを 1 つに合成し, 判定用のジオメトリエンジンを返す.
+
+        フィーチャ数が多くても contains() の呼び出しは 1 回で済むように,
+        あらかじめ和集合を取っておく。
+        """
+        source_crs = area_source.sourceCrs()
+        transform = None
+        if (source_crs.isValid() and target_crs.isValid()
+                and source_crs != target_crs):
+            transform = QgsCoordinateTransform(
+                source_crs, target_crs, context.transformContext())
+
+        geometries = []
+        for feature in area_source.getFeatures():
+            geometry = feature.geometry()
+            if geometry is None or geometry.isNull() or geometry.isEmpty():
+                continue
+            if transform is not None and geometry.transform(transform) != 0:
+                continue
+            geometries.append(geometry)
+
+        if not geometries:
+            feedback.pushWarning(
+                "処理範囲ポリゴンに有効なフィーチャがありません。無視します。")
+            return None
+
+        union = QgsGeometry.unaryUnion(geometries)
+        if union.isEmpty():
+            feedback.pushWarning(
+                "処理範囲ポリゴンの合成に失敗しました。無視します。")
+            return None
+
+        engine = QgsGeometry.createGeometryEngine(union.constGet())
+        engine.prepareGeometry()
+        return engine
+
+    @staticmethod
+    def _filter_by_area(xs, ys, engine, feedback):
+        """点群のうち, 処理範囲ポリゴンの内側にあるものの真偽配列を返す."""
+        keep = np.zeros(xs.size, dtype=bool)
+        for i in range(xs.size):
+            if feedback.isCanceled():
+                break
+            point = QgsGeometry.fromPointXY(
+                QgsPointXY(float(xs[i]), float(ys[i])))
+            keep[i] = engine.intersects(point.constGet())
+        return keep
+
+    # ------------------------------------------------------------------
     def _scan(self, reader, window_size, min_height, merge_plateaus,
               block_size, smooth_method, smooth_size, sigma_cells,
-              height_from_smoothed, feedback):
+              height_from_smoothed, region, feedback):
         """ブロックを走査して候補セルを集める."""
         # 平滑化もカーネル半径のぶん周囲を必要とするので halo に足す。
         # これを忘れるとブロック境界付近の平滑値が全域処理と一致しなくなる。
         halo = window_size // 2 + smoothing.smoothing_radius(
             smooth_method, smooth_size, sigma_cells)
         total = raster_reader.count_blocks(
-            reader.width, reader.height, block_size)
+            reader.width, reader.height, block_size, region=region)
 
         row_parts = []
         col_parts = []
@@ -239,7 +344,8 @@ class TreeTopAlgorithm(QgsProcessingAlgorithm):
         processed = 0
 
         for window in raster_reader.iter_blocks(
-                reader.width, reader.height, block_size, halo):
+                reader.width, reader.height, block_size, halo,
+                region=region):
             if feedback.isCanceled():
                 break
 
